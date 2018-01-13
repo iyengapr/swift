@@ -32,6 +32,8 @@ VALID_CHARS = '-' + string.ascii_letters + string.digits
 
 DEFAULT_POLICY_TYPE = REPL_POLICY = 'replication'
 EC_POLICY = 'erasure_coding'
+DEDUPE_POLICY = 'deduplication'
+VIRUS_SCAN_POLICY = 'virus_scanning'
 
 DEFAULT_EC_OBJECT_SEGMENT_SIZE = 1048576
 
@@ -650,6 +652,27 @@ class ECStoragePolicy(BaseStoragePolicy):
 
         return node_index % self.ec_n_unique_fragments
 
+# Adding image compression storage policy - Prashanth
+@BaseStoragePolicy.register(DEDUPE_POLICY)
+class DeduplicationStoragePolicy(BaseStoragePolicy):
+  """
+  Represents a storage policy of type 'replication'.  Default storage policy
+  class unless otherwise overridden from swift.conf.
+
+  Not meant to be instantiated directly; use
+  :func:`~swift.common.storage_policy.reload_storage_policies` to load
+  POLICIES from ``swift.conf``.
+  """
+
+  @property
+  def quorum(self):
+    """
+    Quorum concept in the replication case:
+        floor(number of replica / 2) + 1
+    """
+    if not self.object_ring:
+      raise PolicyError('Ring is not loaded')
+    return quorum_size(self.object_ring.replica_count)
 
 class StoragePolicyCollection(object):
     """
@@ -934,6 +957,29 @@ def reload_storage_policies():
     except PolicyError as e:
         raise SystemExit('ERROR: Invalid Storage Policy Configuration '
                          'in %s (%s)' % (utils.SWIFT_CONF_FILE, e))
+
+# Adding storage policy to enable on-demand virus scanning- Prashanth
+@BaseStoragePolicy.register(VIRUS_SCAN_POLICY)
+class AntiVirusStoragePolicy(BaseStoragePolicy):
+  """
+  Represents a storage policy of type 'replication'.  Default storage policy
+  class unless otherwise overridden from swift.conf.
+
+  Not meant to be instantiated directly; use
+  :func:`~swift.common.storage_policy.reload_storage_policies` to load
+  POLICIES from ``swift.conf``.
+  """
+
+  @property
+  def quorum(self):
+    """
+    Quorum concept in the replication case:
+        floor(number of replica / 2) + 1
+    """
+    if not self.object_ring:
+      raise PolicyError('Ring is not loaded')
+    return quorum_size(self.object_ring.replica_count)
+
 
 
 # parse configuration and setup singleton

@@ -43,6 +43,7 @@ import hashlib
 import logging
 import traceback
 import xattr
+import shutil
 from os.path import basename, dirname, exists, join, splitext
 from random import shuffle
 from tempfile import mkstemp
@@ -57,7 +58,7 @@ from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
     ECBadFragmentChecksum, ECInvalidParameter
 
 from swift import gettext_ as _
-from swift.common.constraints import check_mount, check_dir
+from swift.common.constraints import check_drive
 from swift.common.request_helpers import is_sys_meta
 from swift.common.utils import mkdirs, Timestamp, \
     storage_directory, hash_path, renamer, fallocate, fsync, fdatasync, \
@@ -65,7 +66,7 @@ from swift.common.utils import mkdirs, Timestamp, \
     config_true_value, listdir, split_path, ismount, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
     tpool_reraise, MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
-    O_TMPFILE, makedirs_count, replace_partition_in_path
+    O_TMPFILE, makedirs_count, replace_partition_in_path, md5_hash_for_file, lock_file
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
@@ -74,8 +75,19 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
-    REPL_POLICY, EC_POLICY)
+    REPL_POLICY, EC_POLICY, DEDUPE_POLICY, VIRUS_SCAN_POLICY)
 from functools import partial
+
+# Image compression
+from PIL import Image
+from PIL import ImageFile
+import os
+import subprocess
+
+from subprocess import call
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+COMPRESSED_IMAGE_QUALITY = 20
 
 
 PICKLE_PROTOCOL = 2
@@ -86,7 +98,8 @@ METADATA_KEY = 'user.swift.metadata'
 DROP_CACHE_WINDOW = 1024 * 1024
 # These are system-set metadata keys that cannot be changed with a POST.
 # They should be lowercase.
-DATAFILE_SYSTEM_META = set('content-length deleted etag'.split())
+RESERVED_DATAFILE_META = {'content-length', 'deleted', 'etag'}
+DATAFILE_SYSTEM_META = {'x-static-large-object'}
 DATADIR_BASE = 'objects'
 ASYNCDIR_BASE = 'async_pending'
 TMP_BASE = 'tmp'
@@ -96,7 +109,13 @@ get_tmp_dir = partial(get_policy_string, TMP_BASE)
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
-
+DEDUPLICATION_CONTAINER = "DEDUPED"
+TMP_DEDUPE_FILE_PATH = "/var/tmp/temp_file"
+_authurl = "http://127.0.0.1:8080/auth/v1"
+_user = "test:tester"
+_key = "testing"
+_tenant_name = "test"
+_auth_version = '1'
 
 def _get_filename(fd):
     """
@@ -127,7 +146,82 @@ def _encode_metadata(metadata):
 
     return dict(((encode_str(k), encode_str(v)) for k, v in metadata.items()))
 
+def get_container_info(container):
 
+    from swiftclient.service import SwiftService
+    swift_service = SwiftService()
+    stats_it = swift_service.stat(container)
+    #print stats_it
+    return stats_it
+
+def update_container_metadata(container=None, headerStr=None):
+
+    cmd = "swift post "
+    if (container and headerStr):
+        import subprocess
+        cmd = cmd + "{0} --meta {1}".format(container, headerStr)
+        #print "swift/obj/diskfile.py: update_container_metadata(): command = {}".format(cmd)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        (out, err) = p.communicate()
+        p_status = p.wait()
+        #print "update_container_metadata(): STATUS = {}".format(p_status)
+
+def recursively_search_dedupe_hash_table(dictionary, key):
+
+    for item in dictionary:
+        if key in item.keys():
+            return True
+    return False
+
+def create_meta_file(obj_name, meta_info_dict):
+
+    data_dir = meta_info_dict[obj_name]['datadir']
+    data_file = meta_info_dict[obj_name]['data_file']
+    meta_file = data_file.split('/')[-1].replace(".data", ".meta")
+    meta_file = "{}/{}".format(data_dir, meta_file)
+    #print "swift/obj/server.py: create_meta_file(): data_file = {}".format(data_file)
+    #print "swift/obj/server.py: create_meta_file(): meta_file = {}".format(meta_file)
+    #print "swift/obj/server.py: create_meta_file(): data_dir = {}".format(data_dir)
+
+    # Write metadata to the meta file
+    os.mknod(meta_file) 
+    #print "swift/obj/server.py: create_meta_file(): meta file created? {}".format(os.path.isfile(meta_file))
+    with open(meta_file, "wb+") as fh:
+        try:
+            #print "swift/obj/server.py: create_meta_file(): Attempting to dump dedupe file meta file info ..."
+            pickle.dump(meta_info_dict, fh)
+        except Exception, e:
+            print "swift/obj/server.py: create_meta_file(): pickle dump exception = {}".format(e)
+
+def create_dedupe_tmp_file(data_file):
+
+    #print "swift/obj/diskfile.py: create_dedupe_tmp_file(): DATA_FILE = {}".format(data_file)
+    data = None
+    with open(data_file, "rb") as fh:
+        data = fh.read()
+
+    with open(TMP_DEDUPE_FILE_PATH, "wb") as fh:
+        fh.write(data)
+
+def upload_to_deduped_container(filename, file_info):
+
+    # Store file in tmp path
+    #print "swift/obj/diskfile.py: upload_to_deduped_container(): FILE_INFO = {}".format(file_info)
+    create_dedupe_tmp_file(file_info[filename].get('data_file'))
+    # Upload obj to the 'DEDUPLICATION_CONTAINER'
+    #command = "swift -A {0} -U {1} -K {2} upload {3} {4} --object-name {5}".format(_authurl, _user, _key, DEDUPLICATION_CONTAINER, TMP_DEDUPE_FILE_PATH, filename)
+    command = "swift upload {0} {1} --object-name {2}".format(DEDUPLICATION_CONTAINER, TMP_DEDUPE_FILE_PATH, filename)
+    import subprocess
+    subprocess.call([command], shell=True)
+'''
+def delete_obj_dedupe_policy(container, obj):
+
+    print "swift/obj/diskfile.py: delete_obj_dedupe_policy(): ARGS: container = {0} obj = {1}".format(container, obj)
+    cmd = "swift delete {0} {1}".format(container, obj)
+    print "swift/obj/diskfile.py: delete_obj_dedupe_policy(): DELETE CMD = {}".format(cmd)
+    #import subprocess
+    #subprocess.call([cmd], shell=True)
+'''
 def read_metadata(fd):
     """
     Helper function to read the pickled metadata from an object file.
@@ -579,8 +673,8 @@ class DiskFileRouter(object):
     def __init__(self, *args, **kwargs):
         self.policy_to_manager = {}
         for policy in POLICIES:
-            manager_cls = self.policy_type_to_manager_cls[policy.policy_type]
-            self.policy_to_manager[policy] = manager_cls(*args, **kwargs)
+			manager_cls = self.policy_type_to_manager_cls[policy.policy_type]
+			self.policy_to_manager[policy] = manager_cls(*args, **kwargs)
 
     def __getitem__(self, policy):
         return self.policy_to_manager[policy]
@@ -1191,12 +1285,11 @@ class BaseDiskFileManager(object):
         # we'll do some kind of check unless explicitly forbidden
         if mount_check is not False:
             if mount_check or self.mount_check:
-                check = check_mount
+                mount_check = True
             else:
-                check = check_dir
-            if not check(self.devices, device):
-                return None
-        return os.path.join(self.devices, device)
+                mount_check = False
+            return check_drive(self.devices, device, mount_check)
+        return join(self.devices, device)
 
     @contextmanager
     def replication_lock(self, device):
@@ -1525,7 +1618,6 @@ class BaseDiskFileWriter(object):
 
         :returns: the total number of bytes written to an object
         """
-
         while chunk:
             written = os.write(self._fd, chunk)
             self._upload_size += written
@@ -2058,6 +2150,7 @@ class BaseDiskFile(object):
         self._fp = None
         self._quarantined_dir = None
         self._content_length = None
+        self._partition = partition
         if _datadir:
             self._datadir = _datadir
         else:
@@ -2416,7 +2509,8 @@ class BaseDiskFile(object):
                 self._merge_content_type_metadata(ctype_file)
             sys_metadata = dict(
                 [(key, val) for key, val in self._datafile_metadata.items()
-                 if key.lower() in DATAFILE_SYSTEM_META
+                 if key.lower() in (RESERVED_DATAFILE_META |
+                                    DATAFILE_SYSTEM_META)
                  or is_sys_meta('object', key)])
             self._metadata.update(self._metafile_metadata)
             self._metadata.update(sys_metadata)
@@ -3361,3 +3455,368 @@ class ECDiskFileManager(BaseDiskFileManager):
 
         hash_per_fi = self._hash_suffix_dir(path)
         return dict((fi, md5.hexdigest()) for fi, md5 in hash_per_fi.items())
+
+class DeduplicationDiskFileReader(BaseDiskFileReader):
+  pass
+
+
+class DeduplicationDiskFileWriter(BaseDiskFileWriter):
+  def put(self, metadata):
+    """
+    Finalize writing the file on disk.
+
+    :param metadata: dictionary of metadata to be associated with the
+                     object
+    """
+    super(DeduplicationDiskFileWriter, self)._put(metadata, True)
+
+
+  def _finalize_put(self, metadata, target_path, cleanup):
+   
+    # Write the metadata before calling fsync() so that both data and
+    # metadata are flushed to disk.
+    write_metadata(self._fd, metadata)
+    # We call fsync() before calling drop_cache() to lower the amount of
+    # redundant work the drop cache code will perform on the pages (now
+    # that after fsync the pages will be all clean).
+    fsync(self._fd)
+    # From the Department of the Redundancy Department, make sure we call
+    # drop_cache() after fsync() to avoid redundant work (pages all
+    # clean).
+    drop_buffer_cache(self._fd, 0, self._upload_size)
+    self.manager.invalidate_hash(dirname(self._datadir))
+    # After the rename/linkat completes, this object will be available for
+    # requests to reference.
+    if self._tmppath:
+      # It was a named temp file created by mkstemp()
+      renamer(self._tmppath, target_path)
+    else:
+      # It was an unnamed temp file created by open() with O_TMPFILE
+      link_fd_to_path(self._fd, target_path,
+                      self._diskfile._dirs_created)
+    # If rename is successful, flag put as succeeded. This is done to avoid
+    # unnecessary os.unlink() of tempfile later. As renamer() has
+    # succeeded, the tempfile would no longer exist at its original path.
+    
+    #print "****************************************************"
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): Deduping start ..."
+
+    # Create dict entry for file information
+    #file_info_dict = {}
+    #file_info_dict[self._diskfile._obj] = self._diskfile.__dict__.copy()
+    #print "File Info Dict = {}".format(file_info_dict)
+
+    # Get data file path
+    data_file = self._diskfile._data_file
+    data_file = target_path 
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): Data file : {}".format(data_file)
+
+    # Create a dictionary to store all relevant file metadata information
+    # which will be required to identify the deduped object
+    # print "swift/obj/diskfile.py: datadir = {0} data_file = {1} device = {2} partition = {3} account = {4} container = {5} obj = {6} metadata = {7}".format(self._datadir, self._diskfile.__dict__.get('_data_file'), self._diskfile.__dict__.get('_device_path').split('/')[-1], self._diskfile.__dict__.get('_partition'), self._diskfile.__dict__.get('_account'), self._diskfile.__dict__.get('_container'), self._diskfile.__dict__.get('_obj'), metadata)
+    file_meta_info_dict = {
+    self._diskfile.__dict__.get('_obj'):
+        {
+            'datadir': self._datadir,
+            'data_file': target_path,
+            'device': self._diskfile.__dict__.get('_device_path').split('/')[-1],
+            'partition': self._diskfile.__dict__.get('_partition'),
+            'account': self._diskfile.__dict__.get('_account'),
+            'container': self._diskfile.__dict__.get('_container'),
+            'obj': self._diskfile.__dict__.get('_obj'),
+            'metadata': metadata
+        }
+    }
+
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): File Meta Info Dict = {}".format(file_meta_info_dict)
+
+
+    # Get md5 hash of the file contents
+    file_md5sum = md5_hash_for_file(target_path)
+    metadata["file_hash"] = file_md5sum
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): updated  metadata = {0}".format(metadata)
+    # metadata are flushed to disk.
+    write_metadata(self._fd, metadata)
+
+    #file_md5sum = metadata['ETag']
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): file_md5sum = {}".format(file_md5sum)
+
+    # Create pickle file if none exists
+    dedupe_hash_file_path = "/var/tmp/dedupe_hash_info_{}.txt".format(self._diskfile.__dict__.get('_container'))
+    #print "swift/obj/diskfile.py: DeduplicationDiskFileWriter._finalize_put(): DEDUPE_HASH_FILE_INFO_PATH = {}".format(dedupe_hash_file_path)
+    dummy_hash = {'valid': False}
+    if not os.path.isfile(dedupe_hash_file_path):
+        os.mknod(dedupe_hash_file_path)
+        '''
+        with open(dedupe_hash_file_path, "rb+") as fh:
+            try:
+                print "Creating dedupe hash file..."
+                b = pickle.dump(dummy_hash, fh)
+                print "1. pickle dump = {}".format(b)
+            except Exception, e:
+                print "1. pickle dump exception = {}".format(e)
+            else:
+                print "1. pickle dumped!"
+        '''
+
+    # Load pickle file to read dedupe dict info
+    #dedupe_hash_table = defaultdict(list)
+    import pprint
+    dedupe_hash_table = {}
+    #print "Attempting to pickle load dedupe_hash_table..."
+    with open(dedupe_hash_file_path, "rb+") as fh:
+        try:
+            dedupe_hash_table = pickle.load(fh)
+            # print "2. type dedupe_hash_table = {}".format(type(dedupe_hash_table))
+        except Exception, e:
+            print "2. pickle load exception = {}".format(e)
+
+    #print "Attmpting to update dedupe_hash_table[{0}] = {1}".format(file_md5sum, self._diskfile._obj)
+    isUnique = False
+    if not file_md5sum in dedupe_hash_table.keys():
+        #print "Creating a new entry in the dedupe_hash_table for key [{}]".format(file_md5sum)
+        dedupe_hash_table[file_md5sum] = [file_meta_info_dict]
+        #create_meta_file(self._diskfile._obj, file_meta_info_dict)
+        isUnique = True
+    else:
+        #print "Checking if '{0}' exists in the dedupe_hash_table ...".format(self._diskfile._obj)
+        isFound = recursively_search_dedupe_hash_table(dedupe_hash_table[file_md5sum], self._diskfile._obj)
+        if not isFound:
+            #print "Appending file info for [{}] to the dedupe_hash_table...".format(self._diskfile._obj)
+            file_meta_info_dict[self._diskfile._obj]['deduped'] = 'true'
+            #print "Deduped parent = {}".format(dedupe_hash_table[file_md5sum][0].keys()[0])
+            file_meta_info_dict[self._diskfile._obj]['dedupe_reference_obj_name'] = dedupe_hash_table[file_md5sum][0].keys()[0]
+            dedupe_hash_table[file_md5sum].append(file_meta_info_dict)
+            #create_meta_file(self._diskfile._obj, file_meta_info_dict)
+
+
+    with open(dedupe_hash_file_path, "rb+") as fh:
+        try:
+            pickle.dump(dedupe_hash_table, fh)
+        except Exception, e:
+            print "3. pickle dump exception = {}".format(e)
+
+    # Upload unique files to the 'DEDUPED' container
+    if isUnique:
+        upload_to_deduped_container(self._diskfile._obj, file_meta_info_dict) 
+
+    self._put_succeeded = True
+
+    # Delete data contents 
+    #print "swift/obj/diskfile.py: FILE_META_INFO_DICT = {}".format(file_meta_info_dict)
+    #print "swift/obj/diskfile.py: Attempting to delete .data file for {0} ...".format(self._diskfile._obj)
+    #print "swift/obj/diskfile.py: DATA_DIR = {0} DATA_FILE = {1} ...".format(file_meta_info_dict[self._diskfile._obj]['datadir'], file_meta_info_dict[self._diskfile._obj]['data_file'])
+    if (os.path.isdir(file_meta_info_dict[self._diskfile._obj]['datadir'])):
+        #print "swift/obj/diskfile.py: Proceeding to delete ...".format(file_meta_info_dict[self._diskfile._obj]['datadir'])
+        try:
+            shutil.rmtree(file_meta_info_dict[self._diskfile._obj]['datadir'])
+        except OSError, e:
+            print "swift/obj/diskfile.py: DATA_DIR delete exceptions: {0} - {1}".format(e.filename,e.strerror)
+
+    #print "swift/obj/diskfile.py: Deduping end ..."
+    #print "****************************************************"
+
+    #self._put_succeeded = True
+    '''
+    if cleanup:
+        try:
+            self.manager.cleanup_ondisk_files(self._datadir)['files']
+        except OSError:
+            logging.exception(_('Problem cleaning up %s'), self._datadir)
+    '''
+
+class DeduplicationDiskFile(BaseDiskFile):
+  reader_cls = DeduplicationDiskFileReader
+  writer_cls = DeduplicationDiskFileWriter
+
+  def _get_ondisk_files(self, files):
+
+    #print "swift/obj/diskfile.py: DeduplicationDiskFile._get_ondisk_info() called!"
+    #print "swift/obj/diskfile.py: DeduplicationDiskFile._get_ondisk_info(): self.manager.get_ondisk_files ARGS: files = {0}, datadir = {1}".format(files, self._datadir)
+    self._ondisk_info = self.manager.get_ondisk_files(files, self._datadir)
+    #print "swift/obj/diskfile.py: DeduplicationDiskFile._get_ondisk_info() self._ondisk_info = {0}".format(self._ondisk_info)
+    return self._ondisk_info
+
+@DiskFileRouter.register(DEDUPE_POLICY)
+class DeduplicationDiskFileManager(BaseDiskFileManager):
+    diskfile_cls = DeduplicationDiskFile
+
+    def _process_ondisk_files(self, exts, results, **kwargs):
+        """
+        Implement replication policy specific handling of .data files.
+
+        :param exts: dict of lists of file info, keyed by extension
+        :param results: a dict that may be updated with results
+        """
+        #print "swift/obj/diskfile.py: DeduplicationDiskFileManager._process_ondisk_files() called!"
+        #print "swift/obj/diskfile.py: DeduplicationDiskFileManager._process_ondisk_files(): ARGS: exts = {}".format(exts)
+        if exts.get('.data'):
+            for ext in exts.keys():
+                if ext == '.data':
+                    # older .data's are obsolete
+                    exts[ext], obsolete = self._split_gte_timestamp(
+                        exts[ext], exts['.data'][0]['timestamp'])
+                else:
+                    # other files at same or older timestamp as most recent
+                    # data are obsolete
+                    exts[ext], obsolete = self._split_gt_timestamp(
+                        exts[ext], exts['.data'][0]['timestamp'])
+                results.setdefault('obsolete', []).extend(obsolete)
+
+            # set results
+            results['data_info'] = exts['.data'][0]
+
+        # .meta files *may* be ready for reclaim if there is no data
+        if exts.get('.meta') and not exts.get('.data'):
+            results.setdefault('possible_reclaim', []).extend(
+                exts.get('.meta'))
+
+
+class AntiVirusDiskFileReader(BaseDiskFileReader):
+    pass
+
+class AntiVirusDiskFileWriter(BaseDiskFileWriter):
+    def put(self, metadata):
+        #print "swift/obj/diskfile.py: AntiVirusDiskFileWriter.put(): Overwritting BaseDiskFileWriter.put()..."
+        super(AntiVirusDiskFileWriter, self)._put(metadata, True)
+
+    def _finalize_put(self, metadata, target_path, cleanup):
+        #print "swift/obj/diskfile.py: AntiVirusDiskFileWriter._finalize_put(): Overwritting BaseDiskFileWriter._finalize_put()..."
+        print "swift/obj/diskfile.py: AntiVirusDiskFileWriter._finalize_put(): ARGS: self = {}".format(self._diskfile.__dict__)
+        #print "swift/obj/diskfile.py: AntiVirusDiskFileWriter._finalize_put(): ARGS: metadata = {0}   target_path = {1}         cleanup = {2}".format(metadata, target_path, cleanup)
+
+        # Write the metadata before calling fsync() so that both data and
+        # metadata are flushed to disk.
+        write_metadata(self._fd, metadata)
+        # We call fsync() before calling drop_cache() to lower the amount of
+        # redundant work the drop cache code will perform on the pages (now
+        # that after fsync the pages will be all clean).
+        fsync(self._fd)
+        # From the Department of the Redundancy Department, make sure we call
+        # drop_cache() after fsync() to avoid redundant work (pages all
+        # clean).
+        drop_buffer_cache(self._fd, 0, self._upload_size)
+        self.manager.invalidate_hash(dirname(self._datadir))
+        # After the rename/linkat completes, this object will be available for
+        # requests to reference.
+        if self._tmppath:
+            # It was a named temp file created by mkstemp()
+            renamer(self._tmppath, target_path)
+        else:
+            # It was an unnamed temp file created by open() with O_TMPFILE
+            link_fd_to_path(self._fd, target_path,
+            self._diskfile._dirs_created)
+ 
+       # If rename is successful, flag put as succeeded. This is done to avoid
+        # unnecessary os.unlink() of tempfile later. As renamer() has
+        # succeeded, the tempfile would no longer exist at its original path.
+        self._put_succeeded = True
+
+        print "swift/obj/diskfile.py: _finalize_put(): AntiVirus Policy - START" 
+        data_file = self._diskfile._data_file
+        print "swift/obj/diskfile.py: _finalize_put(): Data file : {}".format(data_file)
+
+        print "swift/obj/diskfile.py: _finalize_put(): Attempting to scan file [{0}]...".format(data_file)
+        import pyclamd
+        cd = pyclamd.ClamdUnixSocket()
+        isInfected = False
+        with open (data_file, "r") as fh:
+            scan = cd.scan_stream(fh)
+            if scan:
+                isInfected = True
+                #print "swift/obj/diskfile.py: AntiVirusDiskFileWriter._finalize_put(): Virus found!!!"
+            #else:
+                #print "swift/obj/diskfile.py: AntiVirusDiskFileWriter._finalize_put(): File is clean"
+        if isInfected:
+            metadata['X-Object-Meta-Infected'] = 'true'
+        else:
+            metadata['X-Object-Meta-Infected'] = 'false'
+
+        try:
+            write_metadata(self._fd, metadata)
+        except Exception, e:
+            print "swift/obj/diskfile.py: _finalize_put(): write_metadata exception = {}".format(e)
+
+        # Set up an InternalClient instance to update container metadata
+        file_count_meta_name = "Num-Infected-Files"
+        name = metadata.get('name')
+        container = name.split("/")[2]
+        #print "swift/obj/diskfile.py: CONTAINER_NAME = {}".format(container)
+        container_info = get_container_info(container)
+        #print "swift/obj/diskfile.py: CONTAINER_INFO = {}".format(container_info)
+        #print "swift/obj/diskfile.py: container_info.get('headers').keys() = {}".format(container_info.get('headers').keys())
+        infected_count = None
+        container_metadata = "X-Container-Meta-" + file_count_meta_name
+        if container_metadata.lower() in container_info.get('headers').keys():
+            print "swift/obj/diskfile.py: _finalize_put(): CUSTOM METADATA FOUND :)"
+            print "swift/obj/diskfile.py: _finalize_put(): CUSTOM_METADATA = {}".format(container_metadata.lower())
+            infected_count = container_info.get('headers').get(container_metadata.lower())
+            print "swift/obj/diskfile.py: CURRENT_INFECTED_FILE_COUNT = {}".format(infected_count)
+            if not infected_count:
+                infected_count = 0
+            if isInfected:
+                updated_header = "{0}:{1}".format(container_metadata, int(infected_count)+1)
+                updated_header = "{0}:{1}".format(file_count_meta_name, int(infected_count)+1)
+                print "swift/obj/diskfile.py: UPDATED_HEADER = {}".format(updated_header)
+                update_container_metadata(container, updated_header)
+        else:
+            print "swift/obj/diskfile.py: _finalize_put(): CUSTOM METADATA NOT FOUND !!!"
+            infected_count = 0
+            if isInfected:
+                infected_count += 1
+            updated_header = "{0}:{1}".format(file_count_meta_name, int(infected_count)+1)
+            print "swift/obj/diskfile.py: UPDATED_HEADER = {}".format(updated_header)
+            update_container_metadata(container, updated_header)
+        print "swift/obj/diskfile.py: _finalize_put(): AntiVirus Policy - END"
+
+'''
+        if cleanup:
+            try:
+                self.manager.cleanup_ondisk_files(self._datadir)['files']
+            except OSError:
+                logging.exception(_('Problem cleaning up %s'), self._datadir)
+'''
+
+class AntiVirusDiskFile(BaseDiskFile):
+  reader_cls = AntiVirusDiskFileReader
+  writer_cls = AntiVirusDiskFileWriter
+
+  def _get_ondisk_files(self, files):
+
+    #print "swift/obj/diskfile.py: AntiVirusDiskFile._get_ondisk_info() called!"
+    #print "swift/obj/diskfile.py: AntiVirusDiskFile._get_ondisk_info(): ARGS: self = {}".format(self.__dict__)
+    #print "swift/obj/diskfile.py: AntiVirusDiskFile._get_ondisk_info(): self.manager.get_ondisk_files ARGS: files = {0}, datadir = {1}".format(files, self._datadir)
+    self._ondisk_info = self.manager.get_ondisk_files(files, self._datadir)
+    #print "swift/obj/diskfile.py: AntiVirusDiskFile._get_ondisk_info() self._ondisk_info = {0}".format(self._ondisk_info)
+    return self._ondisk_info
+
+
+@DiskFileRouter.register(VIRUS_SCAN_POLICY)
+class AntiVirusDiskFileManager(BaseDiskFileManager):
+    diskfile_cls = AntiVirusDiskFile
+
+    def _process_ondisk_files(self, exts, results, **kwargs):
+        # print "swift/obj/diskfile.py: AntiVirusDiskFileManager._process_ondisk_files() called!"
+        # print "swift/obj/diskfile.py: AntiVirusDiskFileManager._process_ondisk_files(): ARGS: self = {}".format(self.__dict__)
+        # print "swift/obj/diskfile.py: AntiVirusDiskFileManager._process_ondisk_files(): ARGS: exts = {}".format(exts)
+        if exts.get('.data'):
+            for ext in exts.keys():
+                if ext == '.data':
+                    # older .data's are obsolete
+                    exts[ext], obsolete = self._split_gte_timestamp(
+                        exts[ext], exts['.data'][0]['timestamp'])
+                else:
+                    # other files at same or older timestamp as most recent
+                    # data are obsolete
+                    exts[ext], obsolete = self._split_gt_timestamp(
+                        exts[ext], exts['.data'][0]['timestamp'])
+                results.setdefault('obsolete', []).extend(obsolete)
+
+            # set results
+            results['data_info'] = exts['.data'][0]
+
+        # .meta files *may* be ready for reclaim if there is no data
+        if exts.get('.meta') and not exts.get('.data'):
+            results.setdefault('possible_reclaim', []).extend(
+                exts.get('.meta'))
+

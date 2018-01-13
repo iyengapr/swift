@@ -62,7 +62,7 @@ from swift.common.http import (
     HTTP_PRECONDITION_FAILED, HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY,
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
-                                         ECDriverError, PolicyError)
+                                         ECDriverError, PolicyError, DEDUPE_POLICY, VIRUS_SCAN_POLICY)
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, ResumingGetter, update_headers
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
@@ -2761,3 +2761,327 @@ class ECObjectController(BaseObjectController):
         resp.last_modified = math.ceil(
             float(Timestamp(req.headers['X-Timestamp'])))
         return resp
+
+# Registering new storage policy with Swift - Prashanth
+@ObjectControllerRouter.register(DEDUPE_POLICY)
+class DeduplicationObjectController(BaseObjectController):
+  def _get_or_head_response(self, req, node_iter, partition, policy):
+    concurrency = self.app.get_object_ring(policy.idx).replica_count \
+      if self.app.concurrent_gets else 1
+    resp = self.GETorHEAD_base(
+      req, _('Object'), node_iter, partition,
+      req.swift_entity_path, concurrency)
+    return resp
+
+  def _make_putter(self, node, part, req, headers):
+    if req.environ.get('swift.callback.update_footers'):
+      putter = MIMEPutter.connect(
+        node, part, req.swift_entity_path, headers,
+        conn_timeout=self.app.conn_timeout,
+        node_timeout=self.app.node_timeout,
+        logger=self.app.logger,
+        need_multiphase=False)
+    else:
+      putter = Putter.connect(
+        node, part, req.swift_entity_path, headers,
+        conn_timeout=self.app.conn_timeout,
+        node_timeout=self.app.node_timeout,
+        logger=self.app.logger,
+        chunked=req.is_chunked)
+    return putter
+
+  def _transfer_data(self, req, data_source, putters, nodes):
+    """
+    Transfer data for a replicated object.
+
+    This method was added in the PUT method extraction change
+    """
+    bytes_transferred = 0
+
+    def send_chunk(chunk):
+
+      for putter in list(putters):
+        if not putter.failed:
+          putter.send_chunk(chunk)
+        else:
+          putter.close()
+          putters.remove(putter)
+      self._check_min_conn(
+        req, putters, min_conns,
+        msg=_('Object PUT exceptions during send, '
+              '%(conns)s/%(nodes)s required connections'))
+
+    min_conns = quorum_size(len(nodes))
+    try:
+      with ContextPool(len(nodes)) as pool:
+        for putter in putters:
+          putter.spawn_sender_greenthread(
+            pool, self.app.put_queue_depth, self.app.node_timeout,
+            self.app.exception_occurred)
+        while True:
+          with ChunkReadTimeout(self.app.client_timeout):
+            try:
+              chunk = next(data_source)
+            except StopIteration:
+              break
+          bytes_transferred += len(chunk)
+          if bytes_transferred > constraints.MAX_FILE_SIZE:
+            raise HTTPRequestEntityTooLarge(request=req)
+
+          send_chunk(chunk)
+
+        if req.content_length and (
+            bytes_transferred < req.content_length):
+          req.client_disconnect = True
+          self.app.logger.warning(
+            _('Client disconnected without sending enough data'))
+          self.app.logger.increment('client_disconnects')
+          raise HTTPClientDisconnect(request=req)
+
+        trail_md = self._get_footers(req)
+        for putter in putters:
+          # send any footers set by middleware
+          putter.end_of_object_data(footer_metadata=trail_md)
+
+        for putter in putters:
+          putter.wait()
+        self._check_min_conn(
+          req, [p for p in putters if not p.failed], min_conns,
+          msg=_('Object PUT exceptions after last send, '
+                '%(conns)s/%(nodes)s required connections'))
+    except ChunkReadTimeout as err:
+      self.app.logger.warning(
+        _('ERROR Client read timeout (%ss)'), err.seconds)
+      self.app.logger.increment('client_timeouts')
+      raise HTTPRequestTimeout(request=req)
+    except HTTPException:
+      raise
+    except ChunkReadError:
+      req.client_disconnect = True
+      self.app.logger.warning(
+        _('Client disconnected without sending last chunk'))
+      self.app.logger.increment('client_disconnects')
+      raise HTTPClientDisconnect(request=req)
+    except Timeout:
+      self.app.logger.exception(
+        _('ERROR Exception causing client disconnect'))
+      raise HTTPClientDisconnect(request=req)
+    except Exception:
+      self.app.logger.exception(
+        _('ERROR Exception transferring data to object servers %s'),
+        {'path': req.path})
+      raise HTTPInternalServerError(request=req)
+
+  def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
+    return self.have_quorum(statuses, num_nodes)
+
+  def _store_object(self, req, data_source, nodes, partition,
+                    outgoing_headers):
+    """
+    Store a replicated object.
+
+    This method is responsible for establishing connection
+    with storage nodes and sending object to each one of those
+    nodes. After sending the data, the "best" response will be
+    returned based on statuses from all connections
+    """
+    policy_index = req.headers.get('X-Backend-Storage-Policy-Index')
+    policy = POLICIES.get_by_index(policy_index)
+    if not nodes:
+      return HTTPNotFound()
+
+    putters = self._get_put_connections(
+      req, nodes, partition, outgoing_headers, policy)
+    min_conns = quorum_size(len(nodes))
+    try:
+      # check that a minimum number of connections were established and
+      # meet all the correct conditions set in the request
+      self._check_failure_put_connections(putters, req, min_conns)
+
+      # transfer data
+      print "DATA SENT"
+      print data_source
+      self._transfer_data(req, data_source, putters, nodes)
+
+      # get responses
+      statuses, reasons, bodies, etags = \
+        self._get_put_responses(req, putters, len(nodes))
+    except HTTPException as resp:
+      return resp
+    finally:
+      for putter in putters:
+        putter.close()
+
+    if len(etags) > 1:
+      self.app.logger.error(
+        _('Object servers returned %s mismatched etags'), len(etags))
+      return HTTPServerError(request=req)
+    etag = etags.pop() if len(etags) else None
+    resp = self.best_response(req, statuses, reasons, bodies,
+                              _('Object PUT'), etag=etag)
+    resp.last_modified = math.ceil(
+      float(Timestamp(req.headers['X-Timestamp'])))
+    return resp
+
+# Registering AV storage policy with Swift - Prashanth
+@ObjectControllerRouter.register(VIRUS_SCAN_POLICY)
+class DeduplicationObjectController(BaseObjectController):
+  def _get_or_head_response(self, req, node_iter, partition, policy):
+    concurrency = self.app.get_object_ring(policy.idx).replica_count \
+      if self.app.concurrent_gets else 1
+    resp = self.GETorHEAD_base(
+      req, _('Object'), node_iter, partition,
+      req.swift_entity_path, concurrency)
+    return resp
+
+  def _make_putter(self, node, part, req, headers):
+    if req.environ.get('swift.callback.update_footers'):
+      putter = MIMEPutter.connect(
+        node, part, req.swift_entity_path, headers,
+        conn_timeout=self.app.conn_timeout,
+        node_timeout=self.app.node_timeout,
+        logger=self.app.logger,
+        need_multiphase=False)
+    else:
+      putter = Putter.connect(
+        node, part, req.swift_entity_path, headers,
+        conn_timeout=self.app.conn_timeout,
+        node_timeout=self.app.node_timeout,
+        logger=self.app.logger,
+        chunked=req.is_chunked)
+    return putter
+
+  def _transfer_data(self, req, data_source, putters, nodes):
+    """
+    Transfer data for a replicated object.
+
+    This method was added in the PUT method extraction change
+    """
+    bytes_transferred = 0
+
+    def send_chunk(chunk):
+
+      for putter in list(putters):
+        if not putter.failed:
+          putter.send_chunk(chunk)
+        else:
+          putter.close()
+          putters.remove(putter)
+      self._check_min_conn(
+        req, putters, min_conns,
+        msg=_('Object PUT exceptions during send, '
+              '%(conns)s/%(nodes)s required connections'))
+
+    min_conns = quorum_size(len(nodes))
+    try:
+      with ContextPool(len(nodes)) as pool:
+        for putter in putters:
+          putter.spawn_sender_greenthread(
+            pool, self.app.put_queue_depth, self.app.node_timeout,
+            self.app.exception_occurred)
+        while True:
+          with ChunkReadTimeout(self.app.client_timeout):
+            try:
+              chunk = next(data_source)
+            except StopIteration:
+              break
+          bytes_transferred += len(chunk)
+          if bytes_transferred > constraints.MAX_FILE_SIZE:
+            raise HTTPRequestEntityTooLarge(request=req)
+
+          send_chunk(chunk)
+
+        if req.content_length and (
+            bytes_transferred < req.content_length):
+          req.client_disconnect = True
+          self.app.logger.warning(
+            _('Client disconnected without sending enough data'))
+          self.app.logger.increment('client_disconnects')
+          raise HTTPClientDisconnect(request=req)
+
+        trail_md = self._get_footers(req)
+        for putter in putters:
+          # send any footers set by middleware
+          putter.end_of_object_data(footer_metadata=trail_md)
+
+        for putter in putters:
+          putter.wait()
+        self._check_min_conn(
+          req, [p for p in putters if not p.failed], min_conns,
+          msg=_('Object PUT exceptions after last send, '
+                '%(conns)s/%(nodes)s required connections'))
+    except ChunkReadTimeout as err:
+      self.app.logger.warning(
+        _('ERROR Client read timeout (%ss)'), err.seconds)
+      self.app.logger.increment('client_timeouts')
+      raise HTTPRequestTimeout(request=req)
+    except HTTPException:
+      raise
+    except ChunkReadError:
+      req.client_disconnect = True
+      self.app.logger.warning(
+        _('Client disconnected without sending last chunk'))
+      self.app.logger.increment('client_disconnects')
+      raise HTTPClientDisconnect(request=req)
+    except Timeout:
+      self.app.logger.exception(
+        _('ERROR Exception causing client disconnect'))
+      raise HTTPClientDisconnect(request=req)
+    except Exception:
+      self.app.logger.exception(
+        _('ERROR Exception transferring data to object servers %s'),
+        {'path': req.path})
+      raise HTTPInternalServerError(request=req)
+
+  def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
+    return self.have_quorum(statuses, num_nodes)
+
+  def _store_object(self, req, data_source, nodes, partition,
+                    outgoing_headers):
+    """
+    Store a replicated object.
+
+    This method is responsible for establishing connection
+    with storage nodes and sending object to each one of those
+    nodes. After sending the data, the "best" response will be
+    returned based on statuses from all connections
+    """
+    policy_index = req.headers.get('X-Backend-Storage-Policy-Index')
+    policy = POLICIES.get_by_index(policy_index)
+    if not nodes:
+      return HTTPNotFound()
+
+    putters = self._get_put_connections(
+      req, nodes, partition, outgoing_headers, policy)
+    min_conns = quorum_size(len(nodes))
+    try:
+      # check that a minimum number of connections were established and
+      # meet all the correct conditions set in the request
+      self._check_failure_put_connections(putters, req, min_conns)
+
+      # transfer data
+      print "DATA SENT"
+      print data_source
+      self._transfer_data(req, data_source, putters, nodes)
+
+      # get responses
+      statuses, reasons, bodies, etags = \
+        self._get_put_responses(req, putters, len(nodes))
+    except HTTPException as resp:
+      return resp
+    finally:
+      for putter in putters:
+        putter.close()
+
+    if len(etags) > 1:
+      self.app.logger.error(
+        _('Object servers returned %s mismatched etags'), len(etags))
+      return HTTPServerError(request=req)
+    etag = etags.pop() if len(etags) else None
+    resp = self.best_response(req, statuses, reasons, bodies,
+                              _('Object PUT'), etag=etag)
+    resp.last_modified = math.ceil(
+      float(Timestamp(req.headers['X-Timestamp'])))
+    return resp
+
+

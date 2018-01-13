@@ -23,6 +23,7 @@ import time
 import traceback
 import socket
 import math
+import requests
 from swift import gettext_ as _
 from hashlib import md5
 
@@ -55,8 +56,66 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
     HTTPServerError
-from swift.obj.diskfile import DATAFILE_SYSTEM_META, DiskFileRouter
+from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 
+# ----------------------------
+def get_object_path(account, container, obj):
+    url = "http://localhost:8080/endpoints/{0}/{1}/{2}".format(account, container,obj)
+    result = requests.get(url)
+    if result.status_code == 200:
+        out = result.content
+        out = out.split('[', 1)[1].split(']')[0].split(',')
+        url_path = out[0].replace("\"", "").replace("http://", "").split('/')
+        return url_path
+
+def dedupe_copy_object(source, destination):
+
+    cmd = "swift copy -d /DEDUPED/{0} DEDUPED {1}".format(destination, source)
+    import subprocess
+    #print "swift/obj/server.py: dedupe_copy_object(): command = {}".format(cmd)
+    os.system(cmd)
+    #p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    #(out, err) = p.communicate()
+    #p_status = p.wait()
+    #print "swift/obj/server.py: dedupe_copy_object(): OUT = {0}, ERR = {1}, STATUS = {2}".format(out, err, p_status)
+
+def dedupe_delete_object(obj):
+
+    cmd = "swift delete DEDUPED {}".format(obj)
+    import subprocess
+    #print "swift/obj/server.py: dedupe_delete_object(): command = {}".format(cmd)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    (out, err) = p.communicate()
+    p_status = p.wait()
+    #print "swift/obj/server.py: dedupe_delete_object(): OUT = {0}, ERR = {1}, STATUS = {2}".format(out, err, p_status) 
+
+def dedupe_update_object(source, destination):
+
+    # Download object
+    cwd = os.getcwd()
+    os.chdir("/tmp")
+
+     # Download object
+    cmd = "swift download DEDUPED {}".format(source)
+    import subprocess
+    #print "swift/obj/server.py: dedupe_update_object(): command = {}".format(cmd)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    (out, err) = p.communicate()
+    p_status = p.wait()
+    #print "swift/obj/server.py: dedupe_update_object(): OUT = {0}, ERR = {1}, STATUS = {2}".format(out, err, p_status)
+
+    #Upload object 
+    cmd = "swift upload DEDUPED {0} --object-name {1}".format(source, destination)
+    #print "swift/obj/server.py: dedupe_update_object(): command = {}".format(cmd)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    (out, err) = p.communicate()
+    p_status = p.wait()
+    #print "swift/obj/server.py: dedupe_update_object(): OUT = {0}, ERR = {1}, STATUS = {2}".format(out, err, p_status)    
+
+    os.chdir(cwd)
+
+
+# ----------------------------
 
 def iter_mime_headers_and_bodies(wsgi_input, mime_boundary, read_chunk_size):
     mime_documents_iter = iter_multipart_mime_documents(
@@ -93,6 +152,15 @@ def _make_backend_fragments_header(fragments):
         return json.dumps(result)
     return None
 
+
+def recursively_search_dedupe_hash_table(hash_table, key):
+
+    index = 0
+    for item in hash_table:
+        if key == item.keys()[0]:
+            return item, index
+        index += 1
+    return None, 0
 
 class EventletPlungerString(str):
     """
@@ -133,7 +201,7 @@ class ObjectController(BaseStorageServer):
         self.slow = int(conf.get('slow', 0))
         self.keep_cache_private = \
             config_true_value(conf.get('keep_cache_private', 'false'))
-
+        self.conf = conf
         default_allowed_headers = '''
             content-disposition,
             content-encoding,
@@ -148,7 +216,7 @@ class ObjectController(BaseStorageServer):
         ]
         self.allowed_headers = set()
         for header in extra_allowed_headers:
-            if header not in DATAFILE_SYSTEM_META:
+            if header not in RESERVED_DATAFILE_META:
                 self.allowed_headers.add(header)
         self.auto_create_account_prefix = \
             conf.get('auto_create_account_prefix') or '.'
@@ -172,6 +240,9 @@ class ObjectController(BaseStorageServer):
         # network_chunk_size parameter value instead.
         socket._fileobject.default_bufsize = self.network_chunk_size
 
+
+        # UPDATED:
+        self.app_factory_conf = conf
         # Provide further setup specific to an object server implementation.
         self.setup(conf)
 
@@ -237,6 +308,7 @@ class ObjectController(BaseStorageServer):
         DiskFile class would simply over-ride this method to provide that
         behavior.
         """
+        #print "swift/obj/server.py: get_diskfile(): ARGS: self = {0} device = {1} partition = {2} account = {3} container = {4} obj = {5} policy = {6}".format(self, device, partition, account, container, obj, policy)
         return self._diskfile_router[policy].get_diskfile(
             device, partition, account, container, obj, policy, **kwargs)
 
@@ -526,11 +598,6 @@ class ObjectController(BaseStorageServer):
                     override = key.lower().replace(override_prefix, 'x-')
                     update_headers[override] = val
 
-    def _preserve_slo_manifest(self, update_metadata, orig_metadata):
-        if 'X-Static-Large-Object' in orig_metadata:
-            update_metadata['X-Static-Large-Object'] = \
-                orig_metadata['X-Static-Large-Object']
-
     @public
     @timing_stats()
     def POST(self, request):
@@ -573,7 +640,6 @@ class ObjectController(BaseStorageServer):
 
         if req_timestamp > orig_timestamp:
             metadata = {'X-Timestamp': req_timestamp.internal}
-            self._preserve_slo_manifest(metadata, orig_metadata)
             metadata.update(val for val in request.headers.items()
                             if (is_user_meta('object', val[0]) or
                                 is_object_transient_sysmeta(val[0])))
@@ -678,6 +744,7 @@ class ObjectController(BaseStorageServer):
     @timing_stats()
     def PUT(self, request):
         """Handle HTTP PUT requests for the Swift Object Server."""
+        #print "swift/obj/server.py: PUT(): ARGS: request = {}".format(request.__dict__)
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
         req_timestamp = valid_timestamp(request)
@@ -901,18 +968,82 @@ class ObjectController(BaseStorageServer):
     @timing_stats()
     def GET(self, request):
         """Handle HTTP GET requests for the Swift Object Server."""
+        #print "swift/obj/server.py: GET(): normal GET() called !!!"
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
+
+        disk_file = None
+        isFound = False
+        #print "swift/obj/server.py: GET(): POLICY INFO: name = {0}, get_info = {1}, idx = {2}, policy_type = {3}".format(policy.name, policy.get_info(), policy.idx, policy.policy_type)
+        dedupe_hash_file_path = "/var/tmp/dedupe_hash_info_{}.txt".format(container)
+        if ((policy.policy_type == 'deduplication') and (os.path.isfile(dedupe_hash_file_path))):
+            # Call HEAD request handler for deduplication if obj entry exists in the dedupe hash file
+            # Open the dedupe hash file
+            dedupe_hash_table = {}
+            file_info = {}
+            with open(dedupe_hash_file_path, "rb+") as fh:
+                try:
+                    dedupe_hash_table = pickle.load(fh)
+                    #print "swift/obj/server.py: GET(): pickled dedupe_hash_table = {}".format(dedupe_hash_table)
+                except:
+                    print "swift/obj/server.py: GET(): pickled dedupe_hash_table load exception = {}".format(e)
+                    
+            if dedupe_hash_table:
+                isFound = False
+                for hashsum in dedupe_hash_table:
+                    file_info, file_idx = recursively_search_dedupe_hash_table(dedupe_hash_table[hashsum], obj)
+                    #print "swift/obj/server.py: GET(): recursively_search_dedupe_hash_table(): RETURN: file_info = {0}, reference_hash_sum = {1}".format(file_info, hashsum)
+                    if file_info:
+                        isFound = True
+                        #print "swift/obj/server.py: GET(): Requested file info found! Calling GET handler for deduplication..."
+                        break
+                if isFound:
+                    req_obj_name = obj
+                    dedupe_reference_obj_name = obj
+                    if 'dedupe_reference_obj_name' in file_info[req_obj_name].keys():
+                        dedupe_reference_obj_name = file_info[req_obj_name].get('dedupe_reference_obj_name')
+                    #print "swift/obj/server.py: GET(): REQUESTED OBJECT NAME = {0}, DEDUPE REFERENCE OBJECT NAME = {1}".format(req_obj_name, dedupe_reference_obj_name)
+                    # Get the duplicate reference object from the DEDUPED container
+                    (d_node_ip_info, d_device, d_partition, d_account, d_container, d_obj) = get_object_path(account, "DEDUPED", dedupe_reference_obj_name)
+
+                    # Make new WSGI environment
+                    from swift.common.wsgi import make_env, make_subrequest
+                    new_env_path = "/{0}/{1}/{2}/{3}/{4}".format(d_device, d_partition, d_account, d_container, d_obj)
+                    #print "swift/obj/server.py: GET(): new_env_path = {}".format(new_env_path)
+                    new_env = make_env(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+
+                    # Make new HEAD sub-request
+                    new_req = make_subrequest(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+
+                    # Create a fresh ObjectController instance to call HEAD() for the deduped reference object
+                    new_obj_controller = ObjectController(self.conf)
+                    #print "swift/obj/server.py: GET(): NEW ObjectController object = {}".format(new_obj_controller)
+                    # Get diskfile
+                    d_device, d_partition, d_account, d_container, d_obj, d_policy = get_name_and_placement(new_req, 5, 5, True)
+                    new_disk_file = new_obj_controller.get_diskfile(d_device, d_partition, d_account, d_container, d_obj, d_policy)
+                    #print "swift/obj/server.py: GET(): NEW DISKFILE OBJECT = {}".format(new_disk_file.__dict__)
+                    try:
+                        with new_disk_file.open():
+                            new_meta = new_disk_file.get_metadata()
+                            #print "swift/obj/server.py: GET(): NEW DISKFILE METADATA = {}".format(new_meta)
+                    except:
+                        return HTTPInsufficientStorage(drive=device, request=request)
+                    else:
+                        disk_file = new_disk_file
+       
+##################################################################################################
+        #print "swift/obj/server.py: GET(): Handling normal GET requests..."
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
-        try:
-            disk_file = self.get_diskfile(
-                device, partition, account, container, obj,
-                policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
-        except DiskFileDeviceUnavailable:
-            return HTTPInsufficientStorage(drive=device, request=request)
+        if not isFound:
+            try:
+                disk_file = self.get_diskfile(
+                    device, partition, account, container, obj,
+                    policy=policy, frag_prefs=frag_prefs,
+                    open_expired=config_true_value(
+                        request.headers.get('x-backend-replication', 'false')))
+            except DiskFileDeviceUnavailable:
+                return HTTPInsufficientStorage(drive=device, request=request)
         try:
             with disk_file.open():
                 metadata = disk_file.get_metadata()
@@ -967,16 +1098,78 @@ class ObjectController(BaseStorageServer):
         """Handle HTTP HEAD requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
-        frag_prefs = safe_json_loads(
-            request.headers.get('X-Backend-Fragment-Preferences'))
-        try:
-            disk_file = self.get_diskfile(
-                device, partition, account, container, obj,
-                policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
-        except DiskFileDeviceUnavailable:
-            return HTTPInsufficientStorage(drive=device, request=request)
+        disk_file = None
+        isFound = False
+        #print "swift/obj/server.py: HEAD(): ARGS: device = {0}, partition = {1}, account = {2}, container = {3}, obj = {4}, policy = {5}".format(device, partition, account, container, obj, policy)
+        #print "swift/obj/server.py: HEAD(): POLICY INFO: name = {0}, get_info = {1}, idx = {2}, policy_type = {3}".format(policy.name, policy.get_info(), policy.idx, policy.policy_type)
+        dedupe_hash_file_path = "/var/tmp/dedupe_hash_info_{}.txt".format(container)
+        if ((policy.policy_type == 'deduplication') and (os.path.isfile(dedupe_hash_file_path))):
+            # Call HEAD request handler for deduplication if obj entry exists in the dedupe hash file
+            # Open the dedupe hash file
+            dedupe_hash_table = {}
+            file_info = {}
+            with open(dedupe_hash_file_path, "rb+") as fh:
+                try:
+                    dedupe_hash_table = pickle.load(fh)
+                    #print "swift/obj/server.py: HEAD(): pickled dedupe_hash_table = {}".format(dedupe_hash_table)
+                except:
+                    print "swift/obj/server.py: HEAD(): pickled dedupe_hash_table load exception = {}".format(e)
+
+            if dedupe_hash_table:
+                isFound = False
+                for hashsum in dedupe_hash_table:
+                    file_info, file_idx = recursively_search_dedupe_hash_table(dedupe_hash_table[hashsum], obj)
+                    #print "swift/obj/server.py: HEAD(): recursively_search_dedupe_hash_table(): RETURN: file_info = {0}, reference_hash_sum = {1}".format(file_info, hashsum)
+                    if file_info:
+                        isFound = True
+                        #print "swift/obj/server.py: HEAD(): Requested file info found! Calling HEAD handler for deduplication..."
+                        break
+                if isFound:
+                    req_obj_name = obj
+                    dedupe_reference_obj_name = obj
+                    if 'dedupe_reference_obj_name' in file_info[req_obj_name].keys():
+                        dedupe_reference_obj_name = file_info[req_obj_name].get('dedupe_reference_obj_name')
+                    #print "swift/obj/server.py: HEAD(): REQUESTED OBJECT NAME = {0}, DEDUPE REFERENCE OBJECT NAME = {1}".format(req_obj_name, dedupe_reference_obj_name)
+                    # Get the duplicate reference object from the DEDUPED container
+                    (d_node_ip_info, d_device, d_partition, d_account, d_container, d_obj) = get_object_path(account, "DEDUPED", dedupe_reference_obj_name)
+
+                    # Make new WSGI environment
+                    from swift.common.wsgi import make_env, make_subrequest
+                    new_env_path = "/{0}/{1}/{2}/{3}/{4}".format(d_device, d_partition, d_account, d_container, d_obj)
+                    #print "swift/obj/server.py: HEAD(): new_env_path = {}".format(new_env_path)
+                    new_env = make_env(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+                    
+                    # Make new HEAD sub-request
+                    new_req = make_subrequest(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+                        
+                    # Create a fresh ObjectController instance to call HEAD() for the deduped reference object
+                    new_obj_controller = ObjectController(self.conf)
+                    #print "swift/obj/server.py: HEAD(): NEW ObjectController object = {}".format(new_obj_controller)
+                    
+                    # Get diskfile
+                    d_device, d_partition, d_account, d_container, d_obj, d_policy = get_name_and_placement(new_req, 5, 5, True)
+                    new_disk_file = new_obj_controller.get_diskfile(d_device, d_partition, d_account, d_container, d_obj, d_policy)
+                    #print "swift/obj/server.py: HEAD(): NEW DISKFILE OBJECT = {}".format(new_disk_file.__dict__)
+                    disk_file = new_disk_file
+##########################################################################################################################
+        if not isFound:
+            #(t_node_ip_info, t_device, t_partition, t_account, t_container, t_obj) = get_object_path(account, "DEDUPED", obj)
+            #org_env_path = "/{0}/{1}/{2}/{3}/{4}".format(t_device, t_partition, t_account, t_container, t_obj)
+            #print "swift/obj/server.py: HEAD(): ORIGINAL ENV PATH  = {}".format(org_env_path)
+            #print "swift/obj/server.py: HEAD(): Proceeding with processing of normal HEAD requests...".format(obj)
+            frag_prefs = safe_json_loads(
+                request.headers.get('X-Backend-Fragment-Preferences'))
+            try:
+                #print "swift/obj/server.py: HEAD(): Attempting to get diskfile info for [{}]".format(obj)
+                disk_file = self.get_diskfile(
+                    device, partition, account, container, obj,
+                    policy=policy, frag_prefs=frag_prefs,
+                    open_expired=config_true_value(
+                        request.headers.get('x-backend-replication', 'false')))
+            except DiskFileDeviceUnavailable:
+                return HTTPInsufficientStorage(drive=device, request=request)
+
+        # Get diskfile metadata
         try:
             metadata = disk_file.read_metadata()
         except DiskFileXattrNotSupported:
@@ -1025,12 +1218,127 @@ class ObjectController(BaseStorageServer):
             get_name_and_placement(request, 5, 5, True)
         req_timestamp = valid_timestamp(request)
         next_part_power = request.headers.get('X-Backend-Next-Part-Power')
-        try:
-            disk_file = self.get_diskfile(
-                device, partition, account, container, obj,
-                policy=policy, next_part_power=next_part_power)
-        except DiskFileDeviceUnavailable:
-            return HTTPInsufficientStorage(drive=device, request=request)
+
+        isDiskFileFound = False
+        sendNoContent = False
+        #print "swift/obj/server.py: DELETE(): POLICY INFO: name = {0}, get_info = {1}, idx = {2}, policy_type = {3}".format(policy.name, policy.get_info(), policy.idx, policy.policy_type)
+        dedupe_hash_file_path = "/var/tmp/dedupe_hash_info_{}.txt".format(container)
+        if ((policy.policy_type == 'deduplication') and (os.path.isfile(dedupe_hash_file_path))):
+        #if ((policy.policy_type == 'muluplication') and (os.path.isfile(dedupe_hash_file_path))):
+            dedupe_hash_table = {}
+            file_info = {}
+            dedupe_ref_checksum = None
+            with open(dedupe_hash_file_path, "rb+") as fh:
+                try:
+                    dedupe_hash_table = pickle.load(fh)
+                    #print "swift/obj/server.py: DELETE(): pickled dedupe_hash_table = {}".format(dedupe_hash_table)
+                except:
+                    print "swift/obj/server.py: DELETE(): pickled dedupe_hash_table load exception = {}".format(e)
+
+            if dedupe_hash_table:
+                isFound = False
+                for hashsum in dedupe_hash_table:
+                    obj_info, obj_info_idx = recursively_search_dedupe_hash_table(dedupe_hash_table[hashsum], obj)
+                    if obj_info:
+                        isFound = True
+                        dedupe_ref_checksum = hashsum
+                        #print "swift/obj/server.py: DELETE(): Requested file info found! Calling HEAD handler for deduplication..."
+                        break
+                if isFound:
+                    dedupe_ref_obj_name = dedupe_hash_table[dedupe_ref_checksum][0].keys()[0]
+                    #dedupe_ref_checksum =  obj_info[obj].get('metadata').get('file_hash')
+                    #print "swift/obj/server.py: DELETE(): DEDUPE_REF: object = {0} checksum = {1}".format(dedupe_ref_obj_name, dedupe_ref_checksum)
+
+                    # Case 1: Last reference for the object in the dedupe_hash_table; Return DiskFile object
+                    if (len(dedupe_hash_table[dedupe_ref_checksum]) == 1):
+
+                        # Proceed to delete the object from the DEDUPED container
+                        #print "swift/obj/server.py: DELETE(): Case 1: Last reference for the object in the dedupe_hash_table; Return DiskFile object..."
+                        # Get the duplicate reference object from the DEDUPED container
+                        (d_node_ip_info, d_device, d_partition, d_account, d_container, d_obj) = get_object_path(account, "DEDUPED", dedupe_ref_obj_name)
+
+                        # Make new WSGI environment
+                        from swift.common.wsgi import make_env, make_subrequest
+                        new_env_path = "/{0}/{1}/{2}/{3}/{4}".format(d_device, d_partition, d_account, d_container, d_obj)
+                        #print "swift/obj/server.py: DELETE(): new_env_path = {}".format(new_env_path)
+                        new_env = make_env(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+                        
+                        # Make new HEAD sub-request
+                        new_req = make_subrequest(request.environ, method='HEAD', path=new_env_path, agent=None, swift_source='SW')
+                            
+                        # Create a fresh ObjectController instance to call HEAD() for the deduped reference object
+                        new_obj_controller = ObjectController(self.conf)
+                        #print "swift/obj/server.py: DELETE(): NEW ObjectController object = {}".format(new_obj_controller)
+                        
+                        # Get diskfile
+                        d_device, d_partition, d_account, d_container, d_obj, d_policy = get_name_and_placement(new_req, 5, 5, True)
+                        disk_file = new_obj_controller.get_diskfile(d_device, d_partition, d_account, d_container, d_obj, d_policy)
+                        if disk_file:
+                            #print "swift/obj/server.py: DELETE(): DISKFILE object = {}".format(disk_file)
+                            isDiskFileFound = True 
+                            
+                        # Delete the reference from the hash table
+                        del dedupe_hash_table[dedupe_ref_checksum]
+                        #print "swift/obj/server.py: DELETE(): CASE 1: END: dedupe_ref_checksum = {}".format(dedupe_ref_checksum)
+                    
+                    #print "swift/obj/server.py: DELETE(): CASE 2 & 3: START: dedupe_ref_checksum = {}".format(dedupe_ref_checksum)
+                    if ((dedupe_ref_checksum in dedupe_hash_table) and len(dedupe_hash_table[dedupe_ref_checksum]) > 1):
+
+                        if (obj == dedupe_ref_obj_name): # Case 2: Main dedupe reference object is to be deleted
+                            #print "swift/obj/server.py: DELETE(): Case 2: Main dedupe reference object is to be deleted..."
+                            #print "swift/obj/server.py: DELETE(): Deleting main dedupe reference obj [{}] from the lookup table...".format(dedupe_ref_obj_name)
+                            new_dedupe_ref_obj_name = dedupe_hash_table[dedupe_ref_checksum][1].keys()[0]
+                            
+                            # Delete main dedupe reference entry and update the hash table with the new dedupe reference obj 
+                            for item in dedupe_hash_table[dedupe_ref_checksum]:
+                                for key, value in item.iteritems():
+                                    if 'dedupe_reference_obj_name' in value:
+                                        #print "swift/obj/server.py: DELETE(): OLD dedupe reference obj name = {}".format(value.get('dedupe_reference_obj_name'))
+                                        #print "swift/obj/server.py: DELETE(): NEW dedupe reference obj name = {}".format(new_dedupe_ref_obj_name)
+                                        value['dedupe_reference_obj_name'] = new_dedupe_ref_obj_name
+
+                            # Create the new dedupe reference by copying from the main refrence in the 'DEDUPED' container
+                            #print "swift/obj/server.py: DELETE(): Attempting to copy dedupe reference object..."
+                            dedupe_update_object(dedupe_ref_obj_name, new_dedupe_ref_obj_name)
+
+                            # Set the new_dedupe_ref_obj data_dir and data_file values to that of the main reference entry
+                            # After updating the dedupe hash table delete the reference from the hash table
+                            del dedupe_hash_table[dedupe_ref_checksum][0]
+                            sendNoContent = True
+
+                        else: # Case 3: Only reference to be deleted
+                            #print "wift/obj/server.py: DELETE():  Case 3: Only reference to be deleted..."
+                            # Delete the reference from the dedupe hash table
+                            del dedupe_hash_table[dedupe_ref_checksum][obj_info_idx]
+                            sendNoContent = True
+
+                    # Write back the updated hash table to the pickle file
+                    #print "swift/obj/server.py: DELETE(): Attempting to dump updated hash table..."
+                    with open(dedupe_hash_file_path, "rb+") as fh:
+                        try:
+                            #print "swift/obj/server.py: DELETE(): dedupe_hash_table type = {}".format(type(dedupe_hash_table))
+                            pickle.dump(dedupe_hash_table, fh)
+                        except Exception, e:
+                            print "swift/obj/server.py: DELETE(): pickle dump exception = {}".format(e)
+
+                    if sendNoContent:
+                        # Return HTTP No content
+                        # print "swift/obj/server.py: DELETE(): Attempting to return HTTPNoContent ..."
+                        response_timestamp =  req_timestamp
+                        response_class = HTTPNoContent
+                        return response_class(
+                                    request=request,
+                                    headers={'X-Backend-Timestamp': response_timestamp.internal})
+
+        if not isDiskFileFound:                           
+            try:
+                disk_file = self.get_diskfile(
+                    device, partition, account, container, obj,
+                    policy=policy, next_part_power=next_part_power)
+            except DiskFileDeviceUnavailable:
+                return HTTPInsufficientStorage(drive=device, request=request)
+
+        # print "swift/obj/server.py: DELETE(): Proceeding with normal DELETE request processing..."
         try:
             orig_metadata = disk_file.read_metadata()
         except DiskFileXattrNotSupported:
@@ -1126,6 +1434,9 @@ class ObjectController(BaseStorageServer):
 
     def __call__(self, env, start_response):
         """WSGI Application entry point for the Swift Object Server."""
+        #print "swift/obj/server.py: __call__() called!!!"
+        #print "swift/obj/server.py: __call__(): ARGS: self = {0}, env = {1}, start_response = {2}".format(self, env, start_response)
+        #print "swift/obj/server.py: __call__(): ARGS: start_response = {}".format(start_response)
         start_time = time.time()
         req = Request(env)
         self.logger.txn_id = req.headers.get('x-trans-id', None)
@@ -1212,7 +1523,7 @@ class ObjectController(BaseStorageServer):
                 return res(env, start_response)
         else:
             return res(env, start_response)
-
+ 
 
 def global_conf_callback(preloaded_app_conf, global_conf):
     """
