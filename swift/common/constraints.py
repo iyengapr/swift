@@ -395,3 +395,27 @@ def valid_api_version(version):
     if not isinstance(VALID_API_VERSIONS, list):
         VALID_API_VERSIONS = [str(VALID_API_VERSIONS)]
     return version in VALID_API_VERSIONS
+
+    
+def check_drive(root, drive, mount_check):
+    """
+    Validate the path given by root and drive is a valid existing directory.
+
+    :param root:  base path where the devices are mounted
+    :param drive: drive name to be checked
+    :param mount_check: additionally require path is mounted
+
+    :returns: full path to the device, or None if drive fails to validate
+    """
+    if not (urllib.parse.quote_plus(drive) == drive):
+        return None
+    path = os.path.join(root, drive)
+    if mount_check:
+        if utils.ismount(path):
+            return path
+    else:
+        if isdir(path):
+            return path
+    return None
+
+
